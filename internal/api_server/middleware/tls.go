@@ -16,6 +16,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// DefaultTLSHandshakeTimeout is the maximum duration to wait for a TLS handshake
+// to complete in ConnContext before timing out and closing the connection.
+const DefaultTLSHandshakeTimeout = 10 * time.Second
+
 func NewHTTPServer(router http.Handler, log logrus.FieldLogger, address string, cfg *config.Config) *http.Server {
 	return &http.Server{
 		Addr:              address,
@@ -37,7 +41,18 @@ func NewHTTPServerWithTLSContext(router http.Handler, log logrus.FieldLogger, ad
 // TLSClientCertConnContext returns a ConnContext function that extracts the peer
 // TLS certificate from a completed handshake and stores it in the request context.
 // Use this when creating an http.Server that requires mTLS client certificate access.
+// Handshake duration is bounded by DefaultTLSHandshakeTimeout to prevent slow or
+// stalled clients from blocking the accept loop.
 func TLSClientCertConnContext(log logrus.FieldLogger) func(context.Context, net.Conn) context.Context {
+	return TLSClientCertConnContextWithTimeout(log, DefaultTLSHandshakeTimeout)
+}
+
+// TLSClientCertConnContextWithTimeout returns a ConnContext function with a configurable
+// handshake timeout. If timeout is zero or negative, DefaultTLSHandshakeTimeout is used.
+func TLSClientCertConnContextWithTimeout(log logrus.FieldLogger, timeout time.Duration) func(context.Context, net.Conn) context.Context {
+	if timeout <= 0 {
+		timeout = DefaultTLSHandshakeTimeout
+	}
 	return func(ctx context.Context, c net.Conn) context.Context {
 		tc, ok := c.(*tls.Conn)
 		if !ok {
@@ -46,11 +61,18 @@ func TLSClientCertConnContext(log logrus.FieldLogger) func(context.Context, net.
 		// We need to ensure TLS handshake is complete before
 		// we try to get anything useful from the ConnectionState.
 		// tls delays handshake until the first Read or Write.
-		err := tc.HandshakeContext(ctx)
+		handshakeCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		err := tc.HandshakeContext(handshakeCtx)
 		if err != nil {
-			remoteAddr := tc.RemoteAddr().String()
+			remoteAddr := ""
+			if tc.RemoteAddr() != nil {
+				remoteAddr = tc.RemoteAddr().String()
+			}
 			log.Errorf("TLS handshake error from %s: %v", remoteAddr, err)
 			log.Errorf("TLS ConnectionState: %#v", tc.ConnectionState())
+			_ = tc.Close()
 			return ctx
 		}
 
